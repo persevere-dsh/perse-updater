@@ -1,0 +1,6 @@
+# Build and install outputs — never committed in this repository.
+node_modules/
+lib/
+*.tgz
+*.tsbuildinfo
+.DS_Store
