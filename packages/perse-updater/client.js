@@ -263,6 +263,17 @@ window.__ModuleLoader__.load({
 			"update.errorAction.port-release": "查看日志",
 			"update.a11y.progress": "更新进度",
 			"update.a11y.progressConfirm": "进度操作确认",
+			// ---- T6 offline recovery panel ----
+			"update.offline.title": "dsh 没有在预期时间内回来",
+			"update.offline.body": "更新已切换，但重启后的实例一直没有应答。这个页面已经加载在你的浏览器里，下面的命令不需要服务器。",
+			"update.offline.commandLabel": "在终端里运行",
+			"update.offline.copy": "复制命令",
+			"update.offline.copied": "已复制",
+			"update.offline.versionLabel": "排查版本",
+			"update.offline.logs": "日志目录：{path}",
+			"update.offline.job": "作业目录：{dir}",
+			"update.offline.retry": "重试连接",
+			"update.offline.note": "若实例已经起来，点「重试连接」即可恢复，不需要刷新页面。",
 		};
 
 		/** English dictionary. */
@@ -429,6 +440,17 @@ window.__ModuleLoader__.load({
 			"update.errorAction.port-release": "Check the log",
 			"update.a11y.progress": "Update progress",
 			"update.a11y.progressConfirm": "Progress action confirmation",
+			// ---- T6 offline recovery panel ----
+			"update.offline.title": "dsh did not come back in time",
+			"update.offline.body": "The update switched, but the restarted instance never answered. This page is already loaded in your browser, and the command below needs no server.",
+			"update.offline.commandLabel": "Run this in a terminal",
+			"update.offline.copy": "Copy command",
+			"update.offline.copied": "Copied",
+			"update.offline.versionLabel": "Version check",
+			"update.offline.logs": "Logs: {path}",
+			"update.offline.job": "Job directory: {dir}",
+			"update.offline.retry": "Retry connection",
+			"update.offline.note": "If the instance is already up, click “Retry connection” — no page reload needed.",
 		};
 
 		/** Error-code → dictionary key, exactly the map of design/ux-spec.md §5. */
@@ -630,11 +652,53 @@ window.__ModuleLoader__.load({
 			"failed", "rolling-back", "rolled-back", "rollback-failed",
 		];
 
-		/** Phases at which the `status()` poll stops. */
+		/**
+		 * Phases with no step left to run.
+		 *
+		 * T6 read this as "the poll stops here". T8 keeps the *page* watching at
+		 * these phases — it only drops from the 1 s in-flight cadence to the slow
+		 * idle cadence (`IDLE_CHECK_MS`), because an idle page must still notice a
+		 * server that was replaced under it.
+		 */
 		const SETTLED_PHASES = ["idle", "switched", "healthy", "failed", "rolled-back", "rollback-failed"];
 
 		/** How often the client polls `status()` while a job is in flight. */
 		const STATUS_POLL_MS = 1000;
+
+		/**
+		 * T8: how often an IDLE page re-reads `status()`.
+		 *
+		 * T6's handshake only ever *adopted* a baseline at load, and the poll that
+		 * fed it stopped at the first settled phase: a page sitting at `idle` asked
+		 * once and never asked again, so a server replaced under an idle page was
+		 * never noticed ("new on disk, old in the tab"). The watch therefore keeps
+		 * running at this slow cadence instead of stopping.
+		 *
+		 * 45 s is deliberately an order of magnitude below the 1 s in-flight poll.
+		 * `status()` is the only fact that carries `runningVersion`, so one read per
+		 * 45 s per idle page is the cheapest cadence that still notices an upgrade
+		 * within a minute — and, unlike a second poll, it *replaces* the fast one
+		 * rather than running beside it (one chained `setTimeout`, one read in
+		 * flight, ever).
+		 */
+		const IDLE_CHECK_MS = 45000;
+
+		/**
+		 * T8: the cadence a hidden tab falls back to. A background tab is doing
+		 * nothing for the operator, so it backs off instead of spending a request
+		 * every 45 s; becoming visible again asks immediately (see the
+		 * `visibilitychange` effect), which is what makes the back-off safe.
+		 */
+		const IDLE_CHECK_HIDDEN_MS = 90000;
+
+		/** Whether this tab is currently hidden, when the platform says so. */
+		function pageHidden() {
+			try {
+				return document.visibilityState === "hidden";
+			} catch (error) {
+				return false;
+			}
+		}
 
 		/**
 		 * How many consecutive poll failures are tolerated. The restart replaces
@@ -1491,6 +1555,306 @@ window.__ModuleLoader__.load({
 			);
 		}
 
+		// ---- T6: version handshake + offline recovery -------------------------
+
+		/**
+		 * How long `status()` must keep failing before the recovery panel is
+		 * warranted. A restart legitimately drops the page for a few seconds
+		 * (ux-spec §4: "重启会断开当前页面，稍后自动重连"), so the panel must not
+		 * fire on the ordinary gap.
+		 */
+		const OFFLINE_AFTER_MS = 20000;
+
+		/**
+		 * Phases that mean "a restart is genuinely in flight". The panel is only
+		 * for a restart that never came back: without one of these the outage is
+		 * not ours and the panel would be a false alarm.
+		 */
+		const RESTART_PHASES = ["switched", "restarting"];
+
+		/** The recovery command, exactly as an operator would type it. */
+		const RECOVERY_COMMAND = "~/.local/bin/dsh web";
+
+		/** The diagnostic command shown beside it. */
+		const RECOVERY_VERSION_COMMAND = "~/.local/bin/dsh --version";
+
+		/** Where dsh writes its logs. */
+		const RECOVERY_LOGS = "~/.dsh/logs/";
+
+		/**
+		 * The harness seam.
+		 *
+		 * A test harness sets `window.__PERSE_UPDATER_TEST__` before loading this
+		 * bundle to substitute the clock and the reload action. Neither the DSH
+		 * host nor the shipped bundle ever sets that global, so in production both
+		 * helpers below take their real path, and the bundle publishes no
+		 * `__internals` handle at all (see the export at the end of the factory).
+		 */
+		function testSeam() {
+			return typeof window !== "undefined" && window.__PERSE_UPDATER_TEST__ !== undefined
+				? window.__PERSE_UPDATER_TEST__
+				: undefined;
+		}
+
+		/** Now, in ms: the seam clock when a harness supplies one, else the real one. */
+		function nowMs() {
+			const seam = testSeam();
+			return seam !== undefined && typeof seam.now === "function" ? seam.now() : Date.now();
+		}
+
+		/**
+		 * Reload the page.
+		 *
+		 * The ONLY caller is the version handshake: a page whose server was
+		 * replaced under it must fetch the bundle the new server ships. Nothing
+		 * else in this bundle reloads, so no other code path can refresh the page.
+		 */
+		function requestReload() {
+			const seam = testSeam();
+			if (seam !== undefined && typeof seam.reload === "function") {
+				seam.reload();
+				return;
+			}
+			window.location.reload();
+		}
+
+		/**
+		 * The version handshake plus the outage clock.
+		 *
+		 * `observe()` is fed every successful `status()` answer, including the
+		 * startup read. The first answer it ever sees is adopted as "the version
+		 * this page was loaded against" — memory only, never persisted. Any later
+		 * answer naming a different `runningVersion` means the process was
+		 * replaced, so the page reloads; that is the single condition.
+		 *
+		 * `fail()` is fed every failed attempt and answers whether the outage has
+		 * lasted long enough, starting from a restart phase, to warrant the panel.
+		 */
+		function createStatusTracker() {
+			/** The version this page was loaded against. In memory only. */
+			let loadedVersion;
+			/** When the current run of consecutive `status()` failures began. */
+			let firstFailureAt = null;
+			/** Phase of the last successful `status()` answer. */
+			let lastPhase;
+			/** `jobId` of the last successful `status()` answer, when it named one. */
+			let lastJobId;
+			return {
+				/**
+				 * One successful `status()` answer.
+				 * @returns `{reload}` — true when a reload was just requested.
+				 */
+				observe(value) {
+					firstFailureAt = null;
+					lastPhase = String(value?.phase ?? "idle");
+					lastJobId = typeof value?.jobId === "string" && value.jobId !== "" ? value.jobId : undefined;
+					const reported = typeof value?.runningVersion === "string" && value.runningVersion !== ""
+						? value.runningVersion
+						: undefined;
+					// Nothing to compare: keep the page. Guessing here would either
+					// reload on every answer or never reload at all.
+					if (reported === undefined) return { reload: false };
+					if (loadedVersion === undefined) {
+						loadedVersion = reported;
+						return { reload: false };
+					}
+					if (reported !== loadedVersion) {
+						requestReload();
+						return { reload: true };
+					}
+					return { reload: false };
+				},
+				/**
+				 * One failed `status()` attempt.
+				 * @returns `{offline}` plus the clock state, for the panel decision.
+				 */
+				fail() {
+					if (firstFailureAt === null) firstFailureAt = nowMs();
+					const waitedMs = nowMs() - firstFailureAt;
+					const restarting = RESTART_PHASES.indexOf(String(lastPhase)) >= 0;
+					return {
+						offline: restarting === true && waitedMs >= OFFLINE_AFTER_MS,
+						waitedMs,
+						restarting,
+						lastPhase,
+					};
+				},
+				/** A recovery attempt restarts the outage clock. */
+				resetOutage() { firstFailureAt = null; },
+				/** The version adopted at startup plus the last answered phase/job. */
+				snapshot() { return { loadedVersion, lastPhase, lastJobId }; },
+			};
+		}
+
+		/**
+		 * The panel's translator.
+		 *
+		 * Falls back to the bundled `en` dictionary rather than the locale service:
+		 * this panel exists precisely for the case where the host is not
+		 * answering, so it must be able to render on its own.
+		 */
+		function offlineText(key, params) {
+			const template = typeof en[key] === "string" ? en[key] : key;
+			if (params === undefined) return template;
+			return template.replace(/\{(\w+)\}/g, (match, name) => (params[name] === undefined ? match : String(params[name])));
+		}
+
+		/** The legacy copy path; needs the selection {@link copyNodeText} made. */
+		function legacyCopy(doc) {
+			try {
+				return typeof doc.execCommand === "function" && doc.execCommand("copy") === true;
+			} catch (error) {
+				return false;
+			}
+		}
+
+		/**
+		 * Copy `text` through a real selection of `node`'s text.
+		 *
+		 * The node is selected first, so the clipboard write and the operator's
+		 * own Ctrl/Cmd+C act on the same genuine DOM text — never an image and
+		 * never a `user-select: none` box.
+		 *
+		 * @returns a boolean or a promise of one.
+		 */
+		function copyNodeText(doc, node, text) {
+			const selection = typeof doc.getSelection === "function" ? doc.getSelection() : undefined;
+			if (selection !== undefined && selection !== null && typeof doc.createRange === "function") {
+				const range = doc.createRange();
+				range.selectNodeContents(node);
+				selection.removeAllRanges();
+				selection.addRange(range);
+			}
+			const clipboard = typeof navigator !== "undefined" ? navigator.clipboard : undefined;
+			if (clipboard !== undefined && clipboard !== null && typeof clipboard.writeText === "function") {
+				try {
+					const written = clipboard.writeText(text);
+					if (written !== undefined && typeof written.then === "function") {
+						return written.then(() => true, () => legacyCopy(doc));
+					}
+					return true;
+				} catch (error) {
+					return legacyCopy(doc);
+				}
+			}
+			return legacyCopy(doc);
+		}
+
+		/**
+		 * Build the offline recovery panel.
+		 *
+		 * Purely local: it reads no remote service and makes no network call, so it
+		 * renders on a page whose server is gone. It is appended to
+		 * `document.body` — above the sidebar and in the root stacking context —
+		 * with a top-of-stack `z-index`, so the host's own reconnect mask cannot
+		 * cover it. Its command is real, selectable text with a copy button.
+		 *
+		 * @returns `{element, destroy}` or `undefined` when there is no document.
+		 */
+		function mountOfflinePanel(options) {
+			const settings = options ?? {};
+			const doc = settings.document ?? (typeof document === "undefined" ? undefined : document);
+			if (doc === undefined || doc.body === undefined || doc.body === null) return undefined;
+			const t = typeof settings.t === "function" ? settings.t : offlineText;
+			/** One styled element. Inline styles: the panel must not depend on host CSS. */
+			const make = (tag, css, text) => {
+				const node = doc.createElement(tag);
+				if (css !== undefined) node.style.cssText = css;
+				if (text !== undefined) node.textContent = text;
+				return node;
+			};
+
+			const root = make("div", "position:fixed;inset:0;margin:0;padding:0;box-sizing:border-box;"
+				+ "display:flex;align-items:center;justify-content:center;background:rgba(4,7,10,0.86);"
+				+ "z-index:2147483000;pointer-events:auto;user-select:text;-webkit-user-select:text;"
+				+ "font-family:system-ui,-apple-system,'Segoe UI',sans-serif;");
+			root.setAttribute("data-perse-update-center", "offline-recovery");
+			root.setAttribute("role", "alertdialog");
+			root.setAttribute("aria-modal", "true");
+			root.setAttribute("aria-label", t("update.offline.title"));
+
+			const card = make("div", "box-sizing:border-box;width:min(560px,92vw);max-height:88vh;overflow:auto;"
+				+ "padding:20px 22px;border-radius:12px;background:#11161d;color:#eef3f8;"
+				+ "border:1px solid rgba(255,255,255,0.18);box-shadow:0 24px 64px rgba(0,0,0,0.6);"
+				+ "user-select:text;-webkit-user-select:text;");
+			card.appendChild(make("div", "font-size:15px;font-weight:600;line-height:1.4;margin:0 0 8px;",
+				t("update.offline.title")));
+			card.appendChild(make("p", "margin:0 0 14px;font-size:13px;line-height:1.6;color:#c9d4e0;",
+				t("update.offline.body")));
+			card.appendChild(make("div", "font-size:12px;color:#9fb0c2;margin:0 0 6px;",
+				t("update.offline.commandLabel")));
+
+			// The command itself: a real, selectable text node.
+			const command = make("code", "display:block;flex:1 1 auto;min-width:0;box-sizing:border-box;"
+				+ "padding:10px 12px;border-radius:8px;background:#05080b;color:#e8eef5;"
+				+ "border:1px solid rgba(255,255,255,0.14);user-select:text;-webkit-user-select:text;"
+				+ "cursor:text;white-space:pre-wrap;word-break:break-all;"
+				+ "font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;line-height:1.5;",
+				RECOVERY_COMMAND);
+			command.setAttribute("data-perse-offline-command", "");
+
+			const copyButton = make("button", "flex:0 0 auto;box-sizing:border-box;padding:8px 12px;"
+				+ "border-radius:8px;border:1px solid rgba(255,255,255,0.24);background:#1d2733;color:#eef3f8;"
+				+ "font-size:12px;cursor:pointer;", t("update.offline.copy"));
+			copyButton.setAttribute("type", "button");
+			copyButton.setAttribute("data-perse-offline-copy", "");
+			copyButton.addEventListener("click", () => {
+				Promise.resolve(copyNodeText(doc, command, RECOVERY_COMMAND)).then((copied) => {
+					const ok = copied === true;
+					copyButton.textContent = ok ? t("update.offline.copied") : t("update.offline.copy");
+					copyButton.setAttribute("data-perse-offline-copied", ok ? "1" : "0");
+				});
+			});
+
+			const commandRow = make("div", "display:flex;gap:8px;align-items:stretch;margin:0 0 12px;");
+			commandRow.appendChild(command);
+			commandRow.appendChild(copyButton);
+			card.appendChild(commandRow);
+
+			// The diagnostic command, also real text.
+			const versionRow = make("div", "display:flex;gap:8px;align-items:baseline;margin:0 0 12px;"
+				+ "font-size:12px;color:#9fb0c2;");
+			versionRow.appendChild(make("span", "flex:0 0 auto;", t("update.offline.versionLabel")));
+			const versionCommand = make("code", "user-select:text;-webkit-user-select:text;cursor:text;"
+				+ "white-space:pre-wrap;word-break:break-all;color:#dfe8f2;"
+				+ "font-family:ui-monospace,SFMono-Regular,Menlo,monospace;", RECOVERY_VERSION_COMMAND);
+			versionCommand.setAttribute("data-perse-offline-version", "");
+			versionRow.appendChild(versionCommand);
+			card.appendChild(versionRow);
+
+			const facts = make("div", "font-size:12px;line-height:1.7;color:#9fb0c2;margin:0 0 14px;");
+			facts.appendChild(make("div", undefined, t("update.offline.logs", { path: RECOVERY_LOGS })));
+			const jobId = typeof settings.jobId === "string" && settings.jobId !== "" ? settings.jobId : undefined;
+			if (jobId !== undefined) {
+				facts.appendChild(make("div", "user-select:text;-webkit-user-select:text;",
+					t("update.offline.job", { dir: `~/.dsh/update-center/jobs/${jobId}` })));
+			}
+			card.appendChild(facts);
+
+			const retryButton = make("button", "box-sizing:border-box;padding:9px 14px;border-radius:8px;"
+				+ "border:1px solid rgba(120,190,255,0.5);background:#12304d;color:#eaf3ff;font-size:13px;"
+				+ "cursor:pointer;", t("update.offline.retry"));
+			retryButton.setAttribute("type", "button");
+			retryButton.setAttribute("data-perse-offline-retry", "");
+			retryButton.addEventListener("click", () => {
+				if (typeof settings.onRetry === "function") settings.onRetry();
+			});
+			const footer = make("div", "display:flex;align-items:center;gap:12px;flex-wrap:wrap;");
+			footer.appendChild(retryButton);
+			footer.appendChild(make("span", "font-size:12px;color:#9fb0c2;", t("update.offline.note")));
+			card.appendChild(footer);
+
+			root.appendChild(card);
+			doc.body.appendChild(root);
+			return {
+				element: root,
+				commandText: RECOVERY_COMMAND,
+				destroy() {
+					if (root.parentNode !== null && root.parentNode !== undefined) root.parentNode.removeChild(root);
+				},
+			};
+		}
+
 		/**
 		 * The sidebar footer action plus its version panel.
 		 *
@@ -1533,10 +1897,33 @@ window.__ModuleLoader__.load({
 			const timerRef = React.useRef(null);
 			/** Consecutive `status()` failures; reset by every successful answer. */
 			const retryRef = React.useRef(0);
+			// ---- T8: the page-wide version watch -----------------------------
+			/**
+			 * Exactly one `status()` read may be in flight. Both the in-flight poll
+			 * and the idle watch go through this latch, so the two cadences can
+			 * never add up to a doubled request.
+			 */
+			const statusBusyRef = React.useRef(false);
+			/** A caller arrived while a read was running; ask again right after it. */
+			const statusWakeRef = React.useRef(false);
+			/** Whether the last observed phase was settled (idle vs in-flight). */
+			const settledRef = React.useRef(true);
+			/** Whether the last `status()` payload is already on screen. */
+			const liveKeyRef = React.useRef(undefined);
 			const isolateRef = React.useRef(null);
 			const triggerRef = React.useRef(null);
 			const reportScrollRef = React.useRef(null);
 			const [reportOverflow, setReportOverflow] = React.useState(false);
+			// ---- T6: version handshake + offline recovery --------------------
+			/** The handshake/outage tracker. Memory only; nothing is persisted. */
+			const trackerRef = React.useRef(null);
+			if (trackerRef.current === null) trackerRef.current = createStatusTracker();
+			/** The mounted offline recovery panel, when one is on screen. */
+			const offlineRef = React.useRef(null);
+			/** The startup handshake read's retry timer. */
+			const handshakeTimerRef = React.useRef(null);
+			/** Latest `refreshStatus`, so the panel's retry never captures a stale one. */
+			const refreshStatusRef = React.useRef(null);
 
 			// D4: the report body is a fixed-height scroller, so an expanded group can
 			// push the last card past the fold. Detect that and say so explicitly
@@ -1555,8 +1942,112 @@ window.__ModuleLoader__.load({
 				return () => observer.disconnect();
 			}, [report, okExpanded, logOpen, open]);
 
-			/** Stop the `status()` poll. Safe to call when nothing is scheduled. */
-			const stopPolling = React.useCallback(() => {
+			/**
+			 * T8: arm the next `status()` read.
+			 *
+			 * This is the single scheduling point for BOTH cadences: the 1 s
+			 * in-flight poll and the slow idle watch are the same chained timer with
+			 * a different delay, so they can never both be armed (the previous tick
+			 * is always dropped first) and never overlap.
+			 *
+			 * @param settled - whether the last observed phase was settled.
+			 * @param immediate - ask on the next tick instead of waiting (used when a
+			 * tab becomes visible again, and to hand over to the in-flight cadence).
+			 */
+			const armStatus = React.useCallback((settled, immediate) => {
+				if (timerRef.current !== null && timerRef.current !== undefined) {
+					clearTimeout(timerRef.current);
+					timerRef.current = null;
+				}
+				// Nothing owns the watch any more (unmounted, or the retry cap was hit).
+				if (pollingRef.current !== true) return;
+				const delay = immediate === true
+					? 0
+					: settled !== true
+						? STATUS_POLL_MS
+						: (pageHidden() === true ? IDLE_CHECK_HIDDEN_MS : IDLE_CHECK_MS);
+				timerRef.current = setTimeout(() => {
+					const run = refreshStatusRef.current;
+					if (typeof run === "function") void run();
+				}, delay);
+			}, []);
+
+			/**
+			 * T8: keep the page's version watch alive after the progress view is left.
+			 *
+			 * T6 stopped the poll outright here; that is exactly the gap T7 found —
+			 * an idle page stopped asking, so it could not notice an upgrade.
+			 */
+			const idleWatch = React.useCallback(() => {
+				pollingRef.current = true;
+				settledRef.current = true;
+				armStatus(true);
+			}, [armStatus]);
+
+			// T6: read the running version once at startup and keep it in memory as
+			// "the version this page was loaded against". The Remote contribution is
+			// mounted fire-and-forget, so the namespace can still be absent here:
+			// retry briefly, then keep looking slowly.
+			//
+			// T8: this first read is also the first link of the page-wide idle watch.
+			// Once the baseline is adopted the chain is armed, so an idle page keeps
+			// asking (slowly) instead of falling silent at load.
+			React.useEffect(() => {
+				let cancelled = false;
+				let attempts = 0;
+				const read = async () => {
+					const namespace = resolveNamespace(ctx);
+					if (namespace === undefined) {
+						if (cancelled === true) return;
+						// Fast retries while the mount settles, then the slow cadence.
+						const delay = attempts < 20 ? 500 : IDLE_CHECK_MS;
+						attempts += 1;
+						handshakeTimerRef.current = setTimeout(() => { void read(); }, delay);
+						return;
+					}
+					try {
+						const answered = await namespace.status();
+						if (cancelled === true || answered === undefined || answered.ok !== true) return;
+						const value = answered.value ?? {};
+						pollingRef.current = true;
+						if (trackerRef.current.observe(value).reload === true) {
+							pollingRef.current = false;
+							return;
+						}
+						settledRef.current = SETTLED_PHASES.indexOf(String(value.phase ?? "idle")) >= 0;
+						armStatus(settledRef.current);
+					} catch (error) {
+						// No baseline yet; try again at the slow cadence rather than
+						// leaving the page with no watch at all.
+						if (cancelled !== true) armStatus(true);
+					}
+				};
+				void read();
+				return () => {
+					cancelled = true;
+					if (handshakeTimerRef.current !== null && handshakeTimerRef.current !== undefined) {
+						clearTimeout(handshakeTimerRef.current);
+						handshakeTimerRef.current = null;
+					}
+				};
+			}, [armStatus, ctx]);
+
+			// T8: a tab that comes back to the foreground catches up at once; a tab
+			// that goes to the background drops to the slow cadence. Both go through
+			// `armStatus`, so neither can add a request on top of a running read.
+			React.useEffect(() => {
+				const onVisibility = () => {
+					if (pollingRef.current !== true) return;
+					if (pageHidden() === true) armStatus(settledRef.current);
+					else armStatus(settledRef.current, true);
+				};
+				document.addEventListener("visibilitychange", onVisibility);
+				return () => document.removeEventListener("visibilitychange", onVisibility);
+			}, [armStatus]);
+
+			// T8: the watch is armed for the life of the page, so unmount must disarm
+			// it — otherwise a pending tick would read `status()` for a dead tree.
+			React.useEffect(() => () => {
 				pollingRef.current = false;
 				if (timerRef.current !== null && timerRef.current !== undefined) {
 					clearTimeout(timerRef.current);
@@ -1564,55 +2055,155 @@ window.__ModuleLoader__.load({
 				}
 			}, []);
 
+			// T6: never leave the recovery panel behind on unmount.
+			React.useEffect(() => () => {
+				const mounted = offlineRef.current;
+				offlineRef.current = null;
+				if (mounted !== null && mounted !== undefined && typeof mounted.destroy === "function") mounted.destroy();
+			}, []);
+
+			// T8: `stopPolling` (T6) is gone. Leaving the progress view no longer
+			// stops the status chain — it drops to the idle cadence (`idleWatch`),
+			// because the chain is also the page's only way to notice an upgrade.
+			// The one hard stop left is unmount, above.
+
+			// ---- T6: version handshake + offline recovery --------------------
+
+			/** Drop the offline recovery panel, if one is mounted. */
+			const hideOffline = React.useCallback(() => {
+				const mounted = offlineRef.current;
+				offlineRef.current = null;
+				if (mounted !== null && mounted !== undefined && typeof mounted.destroy === "function") mounted.destroy();
+			}, []);
+
+			/** The panel's "retry" only restarts this page's own poll. */
+			const retryAfterOutage = React.useCallback(() => {
+				trackerRef.current.resetOutage();
+				retryRef.current = 0;
+				pollingRef.current = true;
+				if (typeof refreshStatusRef.current === "function") void refreshStatusRef.current();
+			}, []);
+
+			/**
+			 * Mount the offline recovery panel.
+			 *
+			 * This path touches no Remote service at all — the server may not exist
+			 * — and it is the only thing in this bundle that renders while
+			 * `status()` is failing.
+			 */
+			const showOffline = React.useCallback(() => {
+				if (offlineRef.current !== null && offlineRef.current !== undefined) return;
+				const snapshot = trackerRef.current.snapshot();
+				const mounted = mountOfflinePanel({
+					t: typeof t === "function" ? t : undefined,
+					jobId: snapshot.lastJobId,
+					onRetry: retryAfterOutage,
+				});
+				offlineRef.current = mounted === undefined ? null : mounted;
+			}, [retryAfterOutage, t]);
+
 			/**
 			 * Rebuild the progress view from `status()`.
 			 *
 			 * `status()` is a pure function of disk + probes (U-09), so polling it
 			 * is exactly the documented reconnect story: nothing is carried in
-			 * memory between calls. The poll keeps rescheduling while the phase is
-			 * still in flight and stops at every settled phase.
+			 * memory between calls. While the phase is in flight the cadence is 1 s;
+			 * at a settled phase T8 drops it to the slow idle watch instead of
+			 * stopping, because the same read is what detects that the server was
+			 * replaced under the page.
 			 */
 			const refreshStatus = React.useCallback(async () => {
-				const namespace = resolveNamespace(ctx);
-				if (namespace === undefined) {
-					setStatusFailure({ code: "update/namespace-missing", message: "remote.updateCenter is not mounted" });
-					pollingRef.current = false;
+				// T8: one read at a time. A caller that arrives while a read is
+				// running is coalesced into it (and re-asked right after), never
+				// allowed to race it into a second request.
+				if (statusBusyRef.current === true) {
+					statusWakeRef.current = true;
 					return;
 				}
-				/** Keep polling through a transient outage; stop after the cap. */
-				const retry = () => {
-					retryRef.current += 1;
-					if (pollingRef.current && retryRef.current <= STATUS_RETRY_MAX) {
-						timerRef.current = setTimeout(() => { void refreshStatus(); }, STATUS_POLL_MS);
-					} else {
-						pollingRef.current = false;
-					}
-				};
+				statusBusyRef.current = true;
+				// This read owns the chain now; drop any tick still armed so two
+				// chains can never coexist.
+				if (timerRef.current !== null && timerRef.current !== undefined) {
+					clearTimeout(timerRef.current);
+					timerRef.current = null;
+				}
 				try {
-					const answered = await namespace.status();
-					if (answered === undefined || answered.ok !== true) {
-						setStatusFailure(answered?.error ?? { code: "update/unknown", message: "empty answer" });
-						retry();
+					const namespace = resolveNamespace(ctx);
+					if (namespace === undefined) {
+						setStatusFailure({ code: "update/namespace-missing", message: "remote.updateCenter is not mounted" });
+						pollingRef.current = false;
 						return;
 					}
-					const value = answered.value ?? {};
-					setLive(value);
-					setStatusFailure(undefined);
-					retryRef.current = 0;
-					const settled = SETTLED_PHASES.indexOf(String(value.phase)) >= 0;
-					if (pollingRef.current && settled !== true) {
-						timerRef.current = setTimeout(() => { void refreshStatus(); }, STATUS_POLL_MS);
-					} else {
-						pollingRef.current = false;
+					/**
+					 * Keep polling through a transient outage.
+					 *
+					 * A restart gap (`switched`/`restarting`) keeps T6's 1 s cadence,
+					 * capped by STATUS_RETRY_MAX, so the offline recovery panel still
+					 * arrives on time. A settled page is not in a gap: it waits for
+					 * the next slow check instead of hammering a server that is down.
+					 */
+					const retry = (restarting) => {
+						retryRef.current += 1;
+						if (restarting === true) {
+							if (pollingRef.current && retryRef.current <= STATUS_RETRY_MAX) armStatus(false);
+							else pollingRef.current = false;
+							return;
+						}
+						if (pollingRef.current) armStatus(true);
+					};
+					try {
+						const answered = await namespace.status();
+						if (answered === undefined || answered.ok !== true) {
+							setStatusFailure(answered?.error ?? { code: "update/unknown", message: "empty answer" });
+							// T6: an outage that began at a restart phase buys the offline
+							// recovery panel after OFFLINE_AFTER_MS. Nothing else does.
+							const verdict = trackerRef.current.fail();
+							if (verdict.offline === true) showOffline();
+							retry(verdict.restarting === true);
+							return;
+						}
+						const value = answered.value ?? {};
+						// T6: every successful answer runs the version handshake. A page
+						// whose server was replaced under it reloads here, and nowhere else.
+						if (trackerRef.current.observe(value).reload === true) {
+							pollingRef.current = false;
+							return;
+						}
+						hideOffline();
+						// T8: an idle tick often answers exactly what is already on screen;
+						// re-rendering for it would be pure churn.
+						const key = JSON.stringify(value);
+						if (liveKeyRef.current !== key) {
+							liveKeyRef.current = key;
+							setLive(value);
+						}
+						setStatusFailure(undefined);
+						retryRef.current = 0;
+						const settled = SETTLED_PHASES.indexOf(String(value.phase)) >= 0;
+						settledRef.current = settled;
+						armStatus(settled);
+					} catch (error) {
+						setStatusFailure({
+							code: "update/unknown",
+							message: error instanceof Error ? error.message : String(error),
+						});
+						const verdict = trackerRef.current.fail();
+						if (verdict.offline === true) showOffline();
+						retry(verdict.restarting === true);
 					}
-				} catch (error) {
-					setStatusFailure({
-						code: "update/unknown",
-						message: error instanceof Error ? error.message : String(error),
-					});
-					retry();
+				} finally {
+					statusBusyRef.current = false;
+					if (statusWakeRef.current === true) {
+						statusWakeRef.current = false;
+						armStatus(settledRef.current, true);
+					}
 				}
-			}, [ctx]);
+			}, [armStatus, ctx, hideOffline, showOffline]);
+
+			// The panel's retry must reach the newest poll, whatever else changed.
+			React.useEffect(() => {
+				refreshStatusRef.current = refreshStatus;
+			}, [refreshStatus]);
 
 			/** Enter the progress view for one job and start polling its status. */
 			const startProgress = React.useCallback((jobId) => {
@@ -1719,13 +2310,16 @@ window.__ModuleLoader__.load({
 
 			/** Leave the progress/report view without touching anything on disk. */
 			const back = React.useCallback(() => {
-				stopPolling();
+				// T8: leaving the view returns the page to the slow version watch,
+				// it does not switch the watch off.
+				liveKeyRef.current = undefined;
+				idleWatch();
 				setView("versions");
 				setReportFailure(undefined);
 				setStatusFailure(undefined);
 				setProgress(undefined);
 				setLive(undefined);
-			}, [stopPolling]);
+			}, [idleWatch]);
 
 			/** Cancel the second stage: closes it, never reaches `apply` (UI-03). */
 			const cancelConfirm = React.useCallback(() => {
@@ -1818,26 +2412,42 @@ window.__ModuleLoader__.load({
 			/**
 			 * Page-reconnect path: ask `status()` once when the panel opens and, if
 			 * a job is already on disk, rebuild the progress view from it.
+			 *
+			 * T8: this read shares the page-wide single-flight latch with the idle
+			 * watch, so opening the panel during an idle tick can never stack a
+			 * second request, and it hands the watch over to the in-flight cadence
+			 * (or back to the slow one) instead of switching it off.
 			 */
 			const resumeProgress = React.useCallback(async () => {
+				if (statusBusyRef.current === true) {
+					statusWakeRef.current = true;
+					return;
+				}
 				const namespace = resolveNamespace(ctx);
 				if (namespace === undefined) return;
+				statusBusyRef.current = true;
+				pollingRef.current = true;
+				let settled = settledRef.current;
 				try {
 					const answered = await namespace.status();
 					if (answered === undefined || answered.ok !== true) return;
 					const value = answered.value ?? {};
+					liveKeyRef.current = JSON.stringify(value);
 					setLive(value);
+					settled = SETTLED_PHASES.indexOf(String(value.phase)) >= 0;
+					settledRef.current = settled;
 					if (JOB_PHASES.indexOf(String(value.phase)) < 0) return;
 					setProgress(value.jobId === undefined ? undefined : { jobId: String(value.jobId) });
 					setView("progress");
 					setStatusFailure(undefined);
-					const settled = SETTLED_PHASES.indexOf(String(value.phase)) >= 0;
-					pollingRef.current = settled !== true;
-					if (settled !== true) void refreshStatus();
 				} catch (error) {
 					console.error(LOG, "resuming the update progress failed", error);
+				} finally {
+					statusBusyRef.current = false;
+					statusWakeRef.current = false;
+					armStatus(settled);
 				}
-			}, [ctx, refreshStatus]);
+			}, [armStatus, ctx]);
 
 			/**
 			 * D4 / I5: the restart is a user gesture, never an automatic consequence
@@ -1930,18 +2540,21 @@ window.__ModuleLoader__.load({
 			/** Failed phase's retry: run the candidate through preflight again. */
 			const retryFailed = React.useCallback(() => {
 				const version = String(live?.version ?? report?.version ?? selected ?? "");
-				stopPolling();
+				// T8: the version watch survives leaving the progress view.
+				liveKeyRef.current = undefined;
+				idleWatch();
 				if (version === "") {
 					void check(true);
 					return;
 				}
 				void runPreflight(version);
-			}, [live, report, selected, check, runPreflight, stopPolling]);
+			}, [live, report, selected, check, runPreflight, idleWatch]);
 
 			// Dialog close runs for Esc, the mask, and the footer/close buttons alike, so
 			// the focus restore lives here rather than in one key handler.
 			const close = React.useCallback(() => {
-				stopPolling();
+				liveKeyRef.current = undefined;
+				idleWatch();
 				setOpen(false);
 				setConfirming(false);
 				setConfirmAction(undefined);
@@ -1954,7 +2567,7 @@ window.__ModuleLoader__.load({
 				if (node !== null && node !== undefined && typeof node.focus === "function") {
 					requestAnimationFrame(() => node.focus());
 				}
-			}, [stopPolling]);
+			}, [idleWatch]);
 
 			// Esc reaches BOTH stacked dialogs (each `Modal` listens on document). The
 			// first stage therefore treats "a confirmation is open" as "close only the
@@ -2646,6 +3259,21 @@ window.__ModuleLoader__.load({
 		// Test seam only: `scripts/verify-client-bundle.mjs` compares this against the
 		// generated `lib/typert.remote-client.js` so the two faces cannot drift.
 		exports.__contribution = TYPERT_REMOTE;
+		// T6 seam-gated internals: this handle exists ONLY when a harness set
+		// `window.__PERSE_UPDATER_TEST__` before loading the bundle. A shipped page
+		// never sets it, so production has no way to reach these functions, and the
+		// reload/clock substitution in `testSeam()` is likewise unreachable there.
+		if (testSeam() !== undefined) {
+			exports.__internals = {
+				createStatusTracker,
+				mountOfflinePanel,
+				copyNodeText,
+				offlineText,
+				OFFLINE_AFTER_MS,
+				RECOVERY_COMMAND,
+				RECOVERY_VERSION_COMMAND,
+			};
+		}
 		return module.exports;
 	}
 });

@@ -12,6 +12,7 @@
 
 import { existsSync } from 'node:fs'
 import { createConnection } from 'node:net'
+import { readRunningInstall } from '../install.ts'
 import { entryFromBin, readSymlinkTarget } from '../installer/current.ts'
 import type { LauncherEntry } from '../installer/types.ts'
 
@@ -27,6 +28,15 @@ export interface StatusProbes {
   portListening(port: number, timeoutMs?: number): Promise<boolean>
   /** Current time. */
   now(): Date
+  /**
+   * Version of the dsh installation this process is running from, or
+   * `undefined` when it cannot be located.
+   *
+   * This is `readRunningInstall()` — the live install resolved from the running
+   * process — never `state.json`'s job version and never `current.json`'s
+   * pointer, both of which can name a generation this process is not executing.
+   */
+  runningVersion(): string | undefined
 }
 
 /**
@@ -42,6 +52,23 @@ export function createProbes(overrides: Partial<StatusProbes> = {}): StatusProbe
     exists: overrides.exists ?? existsSync,
     portListening: overrides.portListening ?? portListening,
     now: overrides.now ?? ((): Date => new Date()),
+    runningVersion: overrides.runningVersion ?? runningInstallVersion,
+  }
+}
+
+/**
+ * The running installation's version, or `undefined` when it cannot be located.
+ *
+ * A missing running install must not fail `status()`: the field is omitted and a
+ * client keeps its page instead of guessing a version.
+ *
+ * @returns the live version, or `undefined`.
+ */
+export function runningInstallVersion(): string | undefined {
+  try {
+    return readRunningInstall().version
+  } catch {
+    return undefined
   }
 }
 

@@ -146,6 +146,20 @@ export interface UpdateStatus {
   readonly phase: UpdatePhase
   /** Version the current job targets, when one is known. */
   readonly version?: string
+  /**
+   * The dsh version the answering process is **actually running**, read from the
+   * live installation at answer time.
+   *
+   * Deliberately not `version`: that is what the last job *targeted*, so it is
+   * already the new number while the old process still serves the page (and it
+   * stays wrong after a rollback). A client that loaded its bundle from one
+   * server generation uses this field to notice the process was replaced and
+   * reload itself, so it must describe the process that answered, never a job.
+   *
+   * Absent only when no running installation can be located; a client must then
+   * keep its page rather than guess.
+   */
+  readonly runningVersion?: string
   /** Identifier of the running job, when one is running. */
   readonly jobId?: string
   /** Pipeline steps. */

@@ -27,6 +27,14 @@ export interface StatusSnapshot {
   readonly lock?: LockRecord
   /** A report snapshot to surface when `state.json` does not carry one. */
   readonly report?: PreflightReport
+  /**
+   * The running installation's version, read live (see
+   * {@link import('./probes.ts').StatusProbes.runningVersion}).
+   *
+   * A disk snapshot cannot carry this: it describes the process answering, which
+   * no file on disk is authoritative about.
+   */
+  readonly runningVersion?: string
   /** Port and symlink probes. */
   readonly probes: StatusProbes
 }
@@ -46,6 +54,7 @@ export async function rebuildStatus(snapshot: StatusSnapshot): Promise<UpdateSta
   const steps = mergeSteps(state?.steps ?? [], progress)
   const phase: UpdatePhase = state?.phase ?? 'idle'
   const report = state?.report ?? snapshot.report
+  const runningVersion = snapshot.runningVersion ?? probes.runningVersion()
   // The verified backup path is disk-derived only: `state.json` records the one
   // this job wrote, and `current.json` records the one a rollback would restore.
   const patchBackup = state?.patchBackup ?? current?.patchBackup
@@ -59,6 +68,7 @@ export async function rebuildStatus(snapshot: StatusSnapshot): Promise<UpdateSta
     ...(state?.jobId === undefined ? {} : { jobId: state.jobId }),
     ...(state?.error === undefined ? {} : { error: { ...state.error } }),
     ...(report === undefined ? {} : { report }),
+    ...(runningVersion === undefined ? {} : { runningVersion }),
     ...(patchBackup === undefined ? {} : { patchBackup }),
   }
   return status
